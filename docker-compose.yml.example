@@ -9,7 +9,7 @@ x-osserver:
   restart: always
 x-osserver-env: &default-osserver-env
     DEFAULT_FROM_EMAIL: "noreply@example.com"
-    REDIS_REPLICAS: 3 # must match redis-slave replicas below!
+    REDIS_REPLICAS: 1 # must match redis-slave replicas below!
     INSTANCE_DOMAIN: "http://example.com:8000"
     SERVER_IS_SECONDARY: # unset
 x-pgnode:
