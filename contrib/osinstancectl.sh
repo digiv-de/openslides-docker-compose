@@ -11,17 +11,9 @@ TEMPLATE_REPO="/srv/openslides/openslides-docker-compose"
 # TEMPLATE_REPO="https://github.com/OpenSlides/openslides-docker-compose"
 OSDIR="/srv/openslides"
 INSTANCES="${OSDIR}/docker-instances"
-DEFAULT_DOCKER_IMAGE_NAME_OPENSLIDES=openslides/openslides-server
-DEFAULT_DOCKER_IMAGE_TAG_OPENSLIDES=latest
-DEFAULT_DOCKER_IMAGE_NAME_CLIENT=openslides/openslides-client
-DEFAULT_DOCKER_IMAGE_TAG_CLIENT=latest
 YAML_TEMPLATE= # leave empty for automatic (default)
+DOT_ENV_TEMPLATE=
 HOOKS_DIR=
-# If set, these variables override the defaults in the
-# docker-compose.yml.example template file.  They can be configured on the
-# command line as well as in /etc/osinstancectl.
-RELAYHOST=
-MAIN_REPOSITORY_URL= # default repo used for all openslides/* images
 
 ME=$(basename -s .sh "${BASH_SOURCE[0]}")
 CONFIG="/etc/osinstancectl"
@@ -47,7 +39,8 @@ OPT_LOCALONLY=
 OPT_FORCE=
 OPT_WWW=
 OPT_FAST=
-FILTER=
+FILTER_STATE=
+FILTER_VERSION=
 CLONE_FROM=
 ADMIN_SECRETS_FILE="adminsecret.env"
 USER_SECRETS_FILE="usersecret.env"
@@ -66,6 +59,7 @@ BULLET='●'
 SYM_NORMAL="OK"
 SYM_ERROR="XX"
 SYM_UNKNOWN="??"
+SYM_STOPPED="__"
 JQ="jq --monochrome-output"
 
 # Internal options
@@ -79,6 +73,7 @@ enable_color() {
     COL_RED="$(tput setaf 1)"
     COL_YELLOW="$(tput setaf 3)"
     COL_GREEN="$(tput setaf 2)"
+    COL_GRAY="$(tput bold; tput setaf 0)"
     JQ="jq --color-output"
   fi
 }
@@ -114,15 +109,16 @@ Options:
     -i, --image-info   Show image version info (requires instance to be
                        started)
     -n, --online       Show only online instances
-    -f, --offline      Show only offline instances
+    -f, --offline      Show only stopped instances
+    -e, --error        Show only running but unreachable instances
     -M,
     --search-metadata  Include metadata in instance list
     --fast             Include less information to increase listing speed
+    --version          Filter results based on the version reported by
+                       OpenSlides (implies --online)
     -j, --json         Enable JSON output format
 
   for add & update:
-    -r, --default-repo Specifcy the default Docker repository for OpenSlides
-                       images
     --server-image     Specify the OpenSlides server Docker image name
     --server-tag       Specify the OpenSlides server Docker image tag
     --client-image     Specify the OpenSlides client Docker image name
@@ -136,19 +132,12 @@ Options:
                        instance
     --www              Add a www subdomain in addition to the specified
                        instance domain
-    --mailserver       Mail server to configure as Postfix's smarthost (default
-                       is the host system)
 
-Meaning of colored status indicators in ls mode:
+Colored status indicators in ls mode:
   green                The instance appears to be fully functional
-  red                  The instance is unreachable, probably stopped
-  yellow               The instance is started but a websocket connection
-                       cannot be established.  This usually means that the
-                       instance is starting or, if the status persists, that
-                       something is wrong.  Check the logs in this case.  (If
-                       --fast is given, however, this is the best possible
-                       status due to uncertainty and does not necessarily
-                       indicate a problem.)
+  red                  The instance is running but is unreachable
+  yellow               The instance's status can not be determined
+  gray                 The instance has been stopped
 EOF
 }
 
@@ -230,13 +219,9 @@ next_free_port() {
   local HIGHEST_PORT_IN_USE
   local PORT
   HIGHEST_PORT_IN_USE=$(
-    # CONFIG_FILE is dependend on the deployment mode.  Maybe this should be
-    # a wildcard such as docker-*.yml to cover both docker-compose and swarm
-    # deployments at the same time.  However, in any case the check below
-    # (ss) will avoid duplication.
-    find "${INSTANCES}" -type f -name "${CONFIG_FILE}" -print0 |
-    xargs -0 grep -h -o "\.0\.0\.[01]:61[0-9]\{3\}:80"|
-    cut -d: -f2 | sort -rn | head -1
+    find "${INSTANCES}" -type f -name ".env" -print0 |
+    xargs -0 grep -h "EXTERNAL_HTTP_PORT" |
+    cut -d= -f2 | sort -rn | head -1
   )
   [[ -n "$HIGHEST_PORT_IN_USE" ]] || HIGHEST_PORT_IN_USE=61000
   PORT=$((HIGHEST_PORT_IN_USE + 1))
@@ -254,66 +239,38 @@ next_free_port() {
   echo "$PORT"
 }
 
+update_env_file() {
+  [[ -f "$1" ]] || fatal "$1 not found."
+  # Exit if variable is non-empty because it indicates a template customization
+  [[ "${4:-NOFORCE}" = "--force" ]] || ( source "$1" && [[ -z "${!2}" ]] ) || return 0
+  local temp_file="$(mktemp)"
+  gawk -v env_var_name="$2" -v env_var_val="$3" '
+    BEGIN { FS = "="; OFS=FS }
+    $1 == env_var_name { $2 = env_var_val; s=1 }
+    1
+    END { if (!s) printf("%s=%s\n", env_var_name, env_var_val) }
+  ' "$1" >| "$temp_file"
+  cp -f "$temp_file" "$1"
+  rm "$temp_file"
+}
+
 create_config_from_template() {
-  local templ="$1"
-  local config="$2"
-  gawk -v port="${PORT}" \
-      -v domain="$PROJECT_NAME" \
-      -v server_image="$DOCKER_IMAGE_NAME_OPENSLIDES" \
-      -v server_tag="$DOCKER_IMAGE_TAG_OPENSLIDES" \
-      -v client_image="$DOCKER_IMAGE_NAME_CLIENT" \
-      -v client_tag="$DOCKER_IMAGE_TAG_CLIENT" '
-    BEGIN {FS=":"; OFS=FS}
-    $0 ~ /^x-osserver:$/ { s = 1 }
-    $1 ~ /image/ && s {
-      $2 = " " server_image;
-      $3 = server_tag;
-      s = 0
-    }
-
-    $0 ~ /^ +client:$/ { c = 1 }
-    $1 ~ /image/ && c {
-      $2 = " " client_image;
-      $3 = client_tag;
-      c = 0
-    }
-
-    $0 ~ / +ports:$/ { # enter ports section
-      p = $0
-      pi = length(gensub(/(^\ *).*/, "\\1", "g")) # indent level
-      next
-    }
-    pi > 0 && /80"?$/ { # update host port for port 80 mapping
-      $(NF - 1) = port
-      printf("%s\n%s\n", p, $0)
-      pi = 0
-      next
-    }
-    pi > 0 { # strip all other published ports
-      i = length(gensub(/(^\ *).*/, "\\1", "g")) # indent level
-      if ( i > pi ) { next } else { pi = 0 }
-    }
-    1
-  ' "$templ" |
-  gawk -v proj="$PROJECT_NAME" -v relay="$RELAYHOST" \
-      -v repo="$MAIN_REPOSITORY_URL" '
-    BEGIN { FS=": "; OFS=FS; }
-
-    # update INSTANCE_DOMAIN in x-osserver-env
-    $1 ~ "INSTANCE_DOMAIN$" {
-      $2 = "\"https://" proj "\""
-    }
-
-    # Configure all OpenSlides-specific images for custom Docker repository
-    repo && $1 ~ / +image/ && $2 ~ /openslides\// {
-      sub(/openslides\//, repo "/", $2)
-    }
-
-    # Configure mail relay host
-    $1 ~ /MYHOSTNAME$/ { $2 = "\"" proj "\"" }
-    relay != "" && $1 ~ /RELAYHOST$/ { $2 = "\"" relay "\"" }
-    1
-  ' > "$config"
+  local _env="${PROJECT_DIR}/.env"
+  local temp_file
+  temp_file="$(mktemp)"
+  # Create .env
+  [[ ! -f "${_env}" ]] || cp -af "${_env}" "$temp_file"
+  update_env_file "$temp_file" "EXTERNAL_HTTP_PORT" "$PORT"
+  update_env_file "$temp_file" "INSTANCE_DOMAIN" "https://${PROJECT_NAME}"
+  update_env_file "$temp_file" "DOCKER_OPENSLIDES_BACKEND_NAME" "$DOCKER_IMAGE_NAME_OPENSLIDES"
+  update_env_file "$temp_file" "DOCKER_OPENSLIDES_BACKEND_TAG" "$DOCKER_IMAGE_TAG_OPENSLIDES"
+  update_env_file "$temp_file" "DOCKER_OPENSLIDES_FRONTEND_NAME" "$DOCKER_IMAGE_NAME_CLIENT"
+  update_env_file "$temp_file" "DOCKER_OPENSLIDES_FRONTEND_TAG" "$DOCKER_IMAGE_TAG_CLIENT"
+  update_env_file "$temp_file" "POSTFIX_MYHOSTNAME" "$PROJECT_NAME"
+  cp -af "$temp_file" "${_env}"
+  # Create config from template + .env
+  ( set -a && source "${_env}" && m4 "$DCCONFIG_TEMPLATE" > "${DCCONFIG}" )
+  rm -rf "$temp_file" # TODO: trap
 }
 
 create_instance_dir() {
@@ -336,10 +293,10 @@ create_instance_dir() {
       ;;
   esac
   touch "${PROJECT_DIR}/${MARKER}"
+  # Add .env if template available
+  [[ ! -f "$DOT_ENV_TEMPLATE" ]] || cp -af "$DOT_ENV_TEMPLATE" "${PROJECT_DIR}/.env"
   # Add stack name to .env file
-  touch "${PROJECT_DIR}/.env"
-  printf "%s=%s\n" "PROJECT_STACK_NAME" "${PROJECT_STACK_NAME}" \
-    >> "${PROJECT_DIR}/.env"
+  update_env_file "${PROJECT_DIR}/.env" "PROJECT_STACK_NAME" "$PROJECT_STACK_NAME"
 }
 
 gen_pw() {
@@ -403,7 +360,7 @@ add_to_haproxy_cfg() {
     BEGIN {
       begin_block = "-----BEGIN AUTOMATIC OPENSLIDES CONFIG-----"
       end_block   = "-----END AUTOMATIC OPENSLIDES CONFIG-----"
-      use_server_tmpl = "\tuse-server %s if { ssl_fc_sni -i ^%s$ }"
+      use_server_tmpl = "\tuse-server %s if { ssl_fc_sni_reg -i ^%s$ }"
       if ( www == 1 ) {
         use_server_tmpl = "\tuse-server %s if { ssl_fc_sni_reg -i ^(www\\.)?%s$ }"
       }
@@ -447,29 +404,11 @@ remove() {
   echo "Removing instance repo dir..."
   rm -rf "${PROJECT_DIR}"
   echo "acmetool unwant..."
-  acmetool unwant "$PROJECT_NAME"
+  acmetool unwant "$PROJECT_NAME" "www.${PROJECT_NAME}"
   echo "remove HAProxy config..."
   rm_from_haproxy_cfg
   echo "Done."
 }
-
-local_port() {
-  # Retrieve the reverse proxy's published port from config file
-  [[ -f "${1}/${CONFIG_FILE}" ]] &&
-  gawk 'BEGIN { FS=":" }
-    $0 ~ / +client:$/ { c = 1 }
-    c && $0 ~ / +ports:$/ { s = 1; next; }
-    # print second to last element in ports definition, i.e., the local port
-    s && ( NF == 2 || NF == 3 ) {
-      gsub(/[\ "-]/, "")
-      print $(NF - 1)
-      exit
-    }' "${instance}/${CONFIG_FILE}"
-  # better but slower:
-  # docker inspect --format '{{ (index (index .NetworkSettings.Ports "80/tcp") 0).HostPort }}' \
-  #   $(docker-compose ps -q client))
-}
-
 
 ping_instance_simple() {
   # Check if the instance's reverse proxy is listening
@@ -482,47 +421,40 @@ ping_instance_simple() {
   nc -z localhost "$1" || return 1
 }
 
+instance_has_services_running() {
+  # Check if the instance has been deployed.
+  #
+  # This is used as an indicator as to whether the instance is *supposed* to be
+  # running or not.
+  local instance="$1"
+  case "$DEPLOYMENT_MODE" in
+    "compose")
+      # Check if a network exists
+      docker network ls --format '{{ .Name }}' |
+        grep -q "^${instance}_" || return 1
+      ;;
+    "stack")
+      docker stack ls --format '{{ .Name }}' | grep -qw "$instance" || return 1
+      ;;
+  esac
+}
+
 ping_instance_websocket() {
   # Connect to OpenSlides and parse its version string
   #
   # This is a way to test the availability of the app.  Most grave errors in
   # OpenSlides lead to this function failing.
-  LC_ALL=C curl --silent --max-time 0.1 \
+  LC_ALL=C curl --silent --max-time 0.25 \
     "http://127.0.0.1:${1}/apps/core/version/" |
   gawk 'BEGIN { FPAT = "\"[^\"]*\"" } { gsub(/"/, "", $2); print $2}' || true
 }
 
-value_from_yaml() {
-  # XXX: Not a generic YAML parser!
-  # target must be a path, e.g., x-pgnode/labels/org.openslides.role
+value_from_env() {
+  local instance target
   instance="$1"
   target="$2"
-  awk -v target="$2" '
-    BEGIN {
-      FS = ": "; OFS = ""
-      split(target, tree, /\//)
-      levels = length(tree)
-      ospaces = -1
-      skip_lvl = 0
-      search_term = tree[1]
-    }
-    { spaces = length(gensub(/(^\ *).*/, "\\1", "g", $1)); }
-    # This node does not match, so neither will its children
-    $1 !~ search_term { skip_lvl = spaces; }
-    # Skip children
-    skip_lvl && spaces > skip_lvl { next; }
-    $1 ~ search_term && spaces > ospaces {
-      ind++
-      search_term = tree[ind + 1]
-      skip_lvl = 0 # reset
-      ospaces = spaces
-    }
-    $1 ~ search_term && ind == levels { # found the final item
-      $1 = ""  # drop key
-      print $0 # print value
-      exit
-    }
-  ' "${instance}/${CONFIG_FILE}"
+  [[ -f "${instance}/.env" ]] || return 0
+  ( source "${1}/.env" && printf "${!target}" )
 }
 
 highlight_match() {
@@ -546,50 +478,60 @@ ls_instance() {
 
   [[ -f "${instance}/${CONFIG_FILE}" ]] ||
     fatal "$shortname is not a $DEPLOYMENT_MODE instance."
+  [[ -f "${instance}/.env" ]] || fatal "${instance}/.env not found."
 
   #  For stacks, get the normalized shortname
-  if [[ -f "${instance}/.env" ]]; then
-    PROJECT_STACK_NAME=
-    source "${instance}/.env"
-    [[ -z "${PROJECT_STACK_NAME}" ]] ||
-      local normalized_shortname="${PROJECT_STACK_NAME}"
-  fi
+  PROJECT_STACK_NAME="$(value_from_env "$instance" PROJECT_STACK_NAME)"
+  [[ -z "${PROJECT_STACK_NAME}" ]] ||
+    local normalized_shortname="${PROJECT_STACK_NAME}"
 
   # Determine instance state
   local port
   local sym="$SYM_UNKNOWN"
   local version=
-  port=$(local_port "$instance")
-  if [[ -n "$OPT_FAST" ]]; then
+  port="$(value_from_env "$instance" "EXTERNAL_HTTP_PORT")"
+  [[ -n "$port" ]]
+
+  # Check instance deployment state and health
+  if ping_instance_simple "$port"; then
+    # If we can open a connection to the reverse proxy, the instance has been
+    # deployed.
+    sym="$SYM_NORMAL"
     version="[skipped]"
-    ping_instance_simple "$port" || {
+    if [[ -z "$OPT_FAST" ]]; then
+      # If we can fetch the version string from the app this is an indicator of
+      # a fully functional instance.  If we can not, there is a problem.
+      version=$(ping_instance_websocket "$port")
+      [[ -n "$version" ]] || { sym="$SYM_ERROR"; version=; }
+    fi
+  else
+    # If we can not connect to the reverse proxy, the instance may have been
+    # stopped on purpose or there is a problem
+    version=
+    sym="$SYM_STOPPED"
+    if [[ -z "$OPT_FAST" ]] &&
+        instance_has_services_running "$normalized_shortname"; then
+      # The instance has been deployed but it is unreachable
       version=
       sym="$SYM_ERROR"
-    }
-  else
-    # If we can fetch the version string from the app this is an indicator of
-    # a fully functional instance.  If we cannot this could either mean that
-    # the instance has been stopped or that it is only partially working.
-    version=$(ping_instance_websocket "$port")
-    sym="$SYM_NORMAL"
-    if [[ -z "$version" ]]; then
-      sym="$SYM_UNKNOWN"
-      version=
-      # The following function simply checks if the reverse proxy port is open.
-      # If it is the instance is *supposed* to be running but is not fully
-      # functional; otherwise, it is assumed to be turned off on purpose.
-      ping_instance_simple "$port" || sym="$SYM_ERROR"
     fi
   fi
 
   # Filter online/offline instances
-  case "$FILTER" in
+  case "$FILTER_STATE" in
     online)
-      [[ -n "$version" ]] || return 1 ;;
-    offline)
-      [[ -z "$version" ]] || return 1 ;;
+      [[ "$sym" = "$SYM_NORMAL" ]] || return 1 ;;
+    stopped)
+      [[ "$sym" = "$SYM_STOPPED" ]] || return 1 ;;
+    error)
+      [[ "$sym" = "$SYM_ERROR" ]] || [[ "$sym" = "$SYM_UNKNOWN" ]] || return 1 ;;
     *) ;;
   esac
+
+  # Filter based on comparison with the currently running version (as reported
+  # by the Web frontend)
+  [[ -z "$FILTER_VERSION" ]] ||
+    { [[ "$version" = "$FILTER_VERSION" ]] || return 1; }
 
   # Parse metadata for first line (used in overview)
   local first_metadatum=
@@ -613,9 +555,13 @@ ls_instance() {
   # --long
   if [[ -n "$OPT_LONGLIST" ]] || [[ -n "$OPT_JSON" ]]; then
     # Parse docker-compose.yml
-    local server_image client_image
-    server_image=$(value_from_yaml "$instance" x-osserver/image)
-    client_image=$(value_from_yaml "$instance" client/image)
+    local server_image client_image server_tag client_tag
+    server_image="$(value_from_env "$instance" DOCKER_OPENSLIDES_BACKEND_NAME)"
+    server_tag="$(value_from_env "$instance" DOCKER_OPENSLIDES_BACKEND_TAG)"
+    client_image="$(value_from_env "$instance" DOCKER_OPENSLIDES_FRONTEND_NAME)"
+    client_tag="$(value_from_env "$instance" DOCKER_OPENSLIDES_FRONTEND_TAG)"
+    server_image="${server_image}:${server_tag}"
+    client_image="${client_image}:${client_tag}"
     # Parse admin credentials file
     if [[ -f "${instance}/secrets/${ADMIN_SECRETS_FILE}" ]]; then
       source "${instance}/secrets/${ADMIN_SECRETS_FILE}"
@@ -763,6 +709,7 @@ colorize_ls() {
       -v normal="${COL_NORMAL}" \
       -v green="${COL_GREEN}" \
       -v yellow="${COL_YELLOW}" \
+      -v gray="${COL_GRAY}" \
       -v red="${COL_RED}" \
     'BEGIN {
       FPAT = "([[:space:]]*[^[:space:]]+)"
@@ -774,6 +721,7 @@ colorize_ls() {
     /^OK/   { $1 = " " green  bullet normal }
     /^\?\?/ { $1 = " " yellow bullet normal }
     /^XX/   { $1 = " " red    bullet normal }
+    /^__/   { $1 = " " gray   bullet normal }
     1'
   else
     cat -
@@ -836,7 +784,7 @@ clone_secrets() {
 containerid_from_service_name() {
   local id
   local cid
-  id="$(docker service ps -q "$1")"
+  id="$(docker service ps -q --filter desired-state=running "$1")"
   [[ -n "$id" ]] ||
     fatal "Service $1 not found.  Make sure it is running."
   cid="$(docker inspect -f '{{.Status.ContainerStatus.ContainerID}}' "${id}")"
@@ -844,7 +792,7 @@ containerid_from_service_name() {
 }
 
 get_clone_from_id() (
-  source "${1}/.env"
+  PROJECT_STACK_NAME="$(value_from_env "${1}" PROJECT_STACK_NAME)"
   containerid_from_service_name "${PROJECT_STACK_NAME}_${PRIMARY_DATABASE_NODE}"
 )
 
@@ -852,6 +800,7 @@ clone_db() {
   local clone_from_id
   local clone_to_id
   local available_dbs
+  local port
   case "$DEPLOYMENT_MODE" in
     "compose")
       local clone_from_id
@@ -859,15 +808,30 @@ clone_db() {
       _docker_compose "$PROJECT_DIR" up -d --no-deps pgnode1
       clone_from_id="$(_docker_compose "$CLONE_FROM_DIR" ps -q "${PRIMARY_DATABASE_NODE}")"
       clone_to_id="$(_docker_compose "$PROJECT_DIR" ps -q pgnode1)"
-      sleep 20 # XXX
+      until _docker_compose "$PROJECT_DIR" exec pgnode1 pg_isready -q -p 5432; do
+        echo "Waiting for Postgres cluster to become available."
+        sleep 5
+      done
       ;;
     "stack")
       clone_from_id="$(get_clone_from_id "$CLONE_FROM_DIR")"
-      source "${PROJECT_DIR}/.env"
+      PROJECT_STACK_NAME="$(value_from_env "${PROJECT_DIR}" PROJECT_STACK_NAME)"
+      port="$(value_from_env "${PROJECT_DIR}" EXTERNAL_HTTP_PORT)"
+      # Unlike in Compose mode, the complete instance is booted up.  For this
+      # reason, we will also wait for the complete instance to become ready and
+      # then shut down services that may access the database.
       instance_start
-      echo "Waiting 20 seconds for database to become available..."
-      sleep 20 # XXX
+      until [[ -n "$(ping_instance_websocket "$port")" ]]; do
+        echo "Waiting for new instance to become available."
+        sleep 5
+      done
       clone_to_id="$(containerid_from_service_name "${PROJECT_STACK_NAME}_pgnode1")"
+
+      echo "Shutting down other services."
+      docker service rm "${PROJECT_STACK_NAME}_pgbouncer"
+      docker service rm "${PROJECT_STACK_NAME}_prioserver"
+      docker service rm "${PROJECT_STACK_NAME}_server"
+      docker service rm "${PROJECT_STACK_NAME}_media"
       ;;
   esac
   echo "DEBUG: from: $clone_from_id to: $clone_to_id"
@@ -894,9 +858,15 @@ clone_db() {
       sleep 10
       continue
     }
+    until [[ "$(docker exec -u postgres "$clone_to_id" \
+      psql -qAt -c "select count(*) from pg_stat_activity WHERE datname='${db}';")" -eq 0 ]]
+    do
+      echo "DEBUG: Terminate connections to $db."
+      docker exec -u postgres "$clone_to_id" psql -q -c "SELECT pg_terminate_backend(pid)
+          FROM pg_stat_activity WHERE datname='${db}';"
+      sleep 5
+    done
     echo "Recreating db for new instance: ${db}..."
-    docker exec -u postgres "$clone_to_id" psql -q -c "SELECT pg_terminate_backend(pid)
-        FROM pg_stat_activity WHERE datname='${db}';"
     docker exec -u postgres "$clone_to_id" dropdb --if-exists "$db"
     docker exec -u postgres "$clone_to_id" createdb -O openslides "$db"
 
@@ -933,7 +903,7 @@ ask_start() {
         "Next, you should review the configuration file, paying special attention to" \
         "service placement constraints."
       printf "\n%s\n  %s\n" "The configuration file is:" \
-        "$PROJECT_DIR/docker-stack.yml"
+        "$PROJECT_DIR/.env"
       printf "\n%s\n  %s\n" "Afterwards, you can start this instance with:" \
         "\`osstackctl start $PROJECT_NAME\`."
       return 0
@@ -942,13 +912,15 @@ ask_start() {
 }
 
 instance_start() {
+  # Write YAML config
+  ( set -a  && source "${PROJECT_DIR}/.env" && m4 "$DCCONFIG_TEMPLATE" >| "${DCCONFIG}" )
   case "$DEPLOYMENT_MODE" in
     "compose")
       _docker_compose "$PROJECT_DIR" build
       _docker_compose "$PROJECT_DIR" up -d
       ;;
     "stack")
-      source "${PROJECT_DIR}/.env"
+      PROJECT_STACK_NAME="$(value_from_env "${PROJECT_DIR}" PROJECT_STACK_NAME)"
       docker stack deploy -c "${PROJECT_DIR}/docker-stack.yml" \
         "$PROJECT_STACK_NAME"
       ;;
@@ -961,7 +933,7 @@ instance_stop() {
       _docker_compose "$PROJECT_DIR" down
       ;;
     "stack")
-      source "${PROJECT_DIR}/.env"
+      PROJECT_STACK_NAME="$(value_from_env "${PROJECT_DIR}" PROJECT_STACK_NAME)"
       docker stack rm "$PROJECT_STACK_NAME"
     ;;
 esac
@@ -975,6 +947,7 @@ instance_erase() {
     "stack")
       local vol=()
       instance_stop || true
+      run_hook mid-erase
       readarray -t vol < <(
         docker volume ls --format '{{ .Name }}' |
         grep "^${PROJECT_STACK_NAME}_"
@@ -984,96 +957,55 @@ instance_erase() {
         for i in "${vol[@]}"; do
           echo "  docker volume rm $i"
         done
+        echo "WARN: Please note that $ME does not take volumes" \
+          "on other nodes into account."
       fi
-      echo "WARN: Please note that $ME does not take volumes" \
-        "on other nodes into account."
       ;;
   esac
 }
 
 instance_update() {
-  # Try to identify incompatible configuration files
-  if ! grep -q '&default-osserver' "${DCCONFIG}"; then
-    fatal 'This appears to be a legacy configuration file.' \
-      'Please update it by comparing it to the provided example file.'
-  fi
-
-  # Note options to be able to minimize updates
   local server_changed= client_changed=
-  if [[ -n "$DOCKER_IMAGE_NAME_OPENSLIDES" ]] ||
-      [[ -n "$DOCKER_IMAGE_TAG_OPENSLIDES" ]]; then
+  # Update values in .env
+  if [[ -n "$DOCKER_IMAGE_NAME_OPENSLIDES" ]]; then
+    update_env_file "${PROJECT_DIR}/.env" \
+      "DOCKER_OPENSLIDES_BACKEND_NAME" "$DOCKER_IMAGE_NAME_OPENSLIDES" --force
     server_changed=1
   fi
-  if [[ -n "$DOCKER_IMAGE_NAME_CLIENT" ]] ||
-      [[ -n "$DOCKER_IMAGE_TAG_CLIENT" ]]; then
+  if [[ -n "$DOCKER_IMAGE_TAG_OPENSLIDES" ]]; then
+    update_env_file "${PROJECT_DIR}/.env" \
+      "DOCKER_OPENSLIDES_BACKEND_TAG" "$DOCKER_IMAGE_TAG_OPENSLIDES" --force
+    server_changed=1
+  fi
+  if [[ -n "$DOCKER_IMAGE_NAME_CLIENT" ]]; then
+    update_env_file "${PROJECT_DIR}/.env" \
+      "DOCKER_OPENSLIDES_FRONTEND_NAME" "$DOCKER_IMAGE_NAME_CLIENT" --force
+    client_changed=1
+  fi
+  if [[ -n "$DOCKER_IMAGE_TAG_CLIENT" ]]; then
+    update_env_file "${PROJECT_DIR}/.env" \
+      "DOCKER_OPENSLIDES_FRONTEND_TAG" "$DOCKER_IMAGE_TAG_CLIENT" --force
     client_changed=1
   fi
 
-  gawk \
-      -v server_image="$DOCKER_IMAGE_NAME_OPENSLIDES" \
-      -v client_image="$DOCKER_IMAGE_NAME_CLIENT" \
-      -v server_tag="$DOCKER_IMAGE_TAG_OPENSLIDES" \
-      -v client_tag="$DOCKER_IMAGE_TAG_CLIENT" '
-    BEGIN { FS=":"; OFS=FS; }
-    # Server
-    $0 ~ /^x-osserver:$/ { si = 1; st = 1; }
-    server_image && si && $1 ~ /image/ { $2 = " " server_image; si = 0; }
-    server_tag && st && $1 ~ /image/ { $3 = server_tag; st = 0; }
-    # Client
-    $0 ~ /^ +client:$/ { ci = 1; ct = 1; }
-    client_image && ci && $1 ~ /image/ { $2 = " " client_image; ci = 0; }
-    client_tag && ct && $1 ~ /image/ { $3 = client_tag; ct = 0; }
-    1
-    ' "${DCCONFIG}" > "${DCCONFIG}.tmp" &&
-  mv -f "${DCCONFIG}.tmp" "${DCCONFIG}"
-  case "$DEPLOYMENT_MODE" in
-    "compose")
-      echo "Creating services"
-      _docker_compose "$PROJECT_DIR" up -d
-      ;;
-    "stack")
-      local force_opt=
-      local image tag
-      [[ -z "$OPT_FORCE" ]] || local force_opt="--force"
-      source "${PROJECT_DIR}/.env"
-      # Parse image and/or tag from original config if necessary
-      # Server
-      if [[ "$server_changed" ]]; then
-        IFS=: read -r image tag < <(value_from_yaml "$PROJECT_DIR" x-osserver/image)
-        [[ -n "$DOCKER_IMAGE_NAME_OPENSLIDES" ]] ||
-          DOCKER_IMAGE_NAME_OPENSLIDES="${image}"
-        [[ -n "$DOCKER_IMAGE_TAG_OPENSLIDES" ]] ||
-          DOCKER_IMAGE_TAG_OPENSLIDES="${tag}"
-        for i in prioserver server; do
-          if docker service ls --format '{{.Name}}' | grep -q "${PROJECT_STACK_NAME}_${i}"
-          then
-            docker service update --image \
-              "${DOCKER_IMAGE_NAME_OPENSLIDES}:${DOCKER_IMAGE_TAG_OPENSLIDES}" \
-              $force_opt "${PROJECT_STACK_NAME}_${i}"
-          else
-            echo "WARN: ${PROJECT_STACK_NAME}_${i} is not running."
-          fi
-        done
-      fi
-
-      # Client
-      if [[ "$client_changed" ]]; then
-        IFS=: read -r image tag < <(value_from_yaml "$PROJECT_DIR" client/image)
-        [[ -n "$DOCKER_IMAGE_NAME_CLIENT" ]] ||
-          DOCKER_IMAGE_NAME_CLIENT="${image}"
-        [[ -n "$DOCKER_IMAGE_TAG_CLIENT" ]] ||
-          DOCKER_IMAGE_TAG_CLIENT="${tag}"
-        if docker service ls --format '{{.Name}}' | grep -q "${PROJECT_STACK_NAME}_client"
-        then
-          docker service update --image \
-            "${DOCKER_IMAGE_NAME_CLIENT}:${DOCKER_IMAGE_TAG_CLIENT}" \
-            $force_opt "${PROJECT_STACK_NAME}_client"
-        else
-          echo "WARN: ${PROJECT_STACK_NAME}_client is not running."
-        fi
-      fi
-      ;;
-  esac
+  # Start/update if instance was already running
+  local port
+  port="$(value_from_env "$PROJECT_DIR" "EXTERNAL_HTTP_PORT")"
+  if instance_has_services_running "$PROJECT_STACK_NAME"; then
+    case "$DEPLOYMENT_MODE" in
+      "compose")
+        echo "Creating services"
+        _docker_compose "$PROJECT_DIR" up -d
+        ;;
+      "stack")
+        instance_start
+        ;;
+    esac
+  else
+    echo "WARN: ${PROJECT_NAME} is not running."
+    echo "      The configuratation has been updated and the instance will" \
+         "be upgraded upon its next start."
+  fi
 
   # Metadata
   if [[ "$server_changed" ]]; then
@@ -1113,31 +1045,25 @@ instance_config() {
         --format '{{.Self}}\t{{.ID}}\t{{.Hostname}}' |
         awk '$1 == "true" { print $2, $3 }')"
 
-      # Try to find contanier on localhost
-      while read -r taskid; do
-        # This state check could potentially be handled more efficiently using
-        # another --filter.  The observed behavior is that multiple filter
-        # options get combined as an AND expression; however, the official
-        # documentation claims it should be treated as an OR expression.
-        [[ "$(docker inspect --format='{{.Status.State}}' "$taskid")" = "running" ]] || continue
-        containerid="$(docker inspect -f \
-          '{{.Status.ContainerStatus.ContainerID}}' ${taskid})"
-        break
-      done < <(docker service ps --filter "node=$this_node_id" \
-        --format '{{.ID}}' "${PROJECT_STACK_NAME}"_{prio,}server)
-
-      # Failed to find container on localhost; suggest alternatives
-      [[ -n "$containerid" ]] || {
-        echo "Could not find a suitable container for vicfg on local host ($this_node_name)."
-        while read -r node; do
-          printf " Try: ssh -t %s osstackctl vicfg %s\n" "$node" "$PROJECT_NAME"
-        done < <(docker service ps --filter "desired-state=running" \
-          --format '{{.Node}}' "${PROJECT_STACK_NAME}"_{prio,}server | sort -u)
-        exit 6
+      ls_nodes_with_service() {
+        docker service ps --filter "desired-state=running" \
+          --format '{{.Node}} {{.ID}}' "${PROJECT_STACK_NAME}"_{prio,}server | sort -u
       }
+      # Try to find the service on this node...
+      read -r node taskid < <(ls_nodes_with_service | grep "$this_node_name" | head -n1) ||
+      # ...or else pick a service from any node
+      read -r node taskid < <(ls_nodes_with_service | head -n1)
+      containerid="$(docker inspect -f '{{.Status.ContainerStatus.ContainerID}}' ${taskid})"
+      # Connect directly or else through SSH
+      if [[ "$node" = "$this_node_name" ]]; then
+        docker exec -it -e "STACK=${PROJECT_STACK_NAME}" "${containerid}" \
+          bash -c "${container_cmd}"
+      else
+        ssh -q -tt "$node" \
+          "docker exec -it -e 'STACK=${PROJECT_STACK_NAME}' '${containerid}' \\
+            bash -c '${container_cmd}'"
+      fi
 
-      docker exec -it -e "STACK=${PROJECT_STACK_NAME}" "${containerid}" \
-        bash -c "$container_cmd"
       read -p "Update server containers now? [Y/n] " start
       case "$start" in
         Y|y|Yes|yes|YES|"")
@@ -1188,7 +1114,7 @@ case "$(basename "${BASH_SOURCE[0]}")" in
     ;;
 esac
 
-shortopt="haljmiMnfd:r:t:"
+shortopt="haljmiMnfed:t:"
 longopt=(
   help
   color:
@@ -1201,17 +1127,17 @@ longopt=(
   all
   online
   offline
+  error
   metadata
   image-info
   fast
   search-metadata
+  version:
 
   # adding instances
-  default-repo:
   clone-from:
   local-only
   no-add-account
-  mailserver:
   www
 
   # adding & upgrading instances
@@ -1241,10 +1167,6 @@ while true; do
       PROJECT_DIR="$2"
       shift 2
       ;;
-    -r|--default-repo)
-      MAIN_REPOSITORY_URL="$2"
-      shift 2
-      ;;
     --server-image)
       DOCKER_IMAGE_NAME_OPENSLIDES="$2"
       shift 2
@@ -1264,10 +1186,6 @@ while true; do
     -t|--all-tags)
       DOCKER_IMAGE_TAG_OPENSLIDES="$2"
       DOCKER_IMAGE_TAG_CLIENT="$2"
-      shift 2
-      ;;
-    --mailserver)
-      RELAYHOST="$2"
       shift 2
       ;;
     --no-add-account)
@@ -1301,12 +1219,20 @@ while true; do
       shift 1
       ;;
     -n|--online)
-      FILTER="online"
+      FILTER_STATE="online"
       shift 1
       ;;
     -f|--offline)
-      FILTER="offline"
+      FILTER_STATE="stopped"
       shift 1
+      ;;
+    -e|--error)
+      FILTER_STATE="error"
+      shift 1
+      ;;
+    --version)
+      FILTER_VERSION="$2"
+      shift 2
       ;;
     --clone-from)
       CLONE_FROM="$2"
@@ -1408,12 +1334,14 @@ esac
 
 
 DEPS=(
+  acmetool
   docker
   docker-compose
   gawk
-  acmetool
-  nc
   jq
+  m4
+  nc
+  ssh
 )
 # Check dependencies
 for i in "${DEPS[@]}"; do
@@ -1440,17 +1368,18 @@ else
   PROJECT_DIR="${INSTANCES}/${PROJECT_NAME}"
 fi
 
+# The project name is a valid domain which is not suitable as a Docker
+# stack name.  Here, we remove all dots from the domain which turns the
+# domain into a compatible name.  This also appears to be the method
+# docker-compose uses to name its containers, networks, etc.
+PROJECT_STACK_NAME="$(echo "$PROJECT_NAME" | tr -d '.')"
+
 case "$DEPLOYMENT_MODE" in
   "compose")
     CONFIG_FILE="docker-compose.yml"
     ;;
   "stack")
     CONFIG_FILE="docker-stack.yml"
-    # The project name is a valid domain which is not suitable as a Docker
-    # stack name.  Here, we remove all dots from the domain which turns the
-    # domain into a compatible name.  This also appears to be the method
-    # docker-compose uses to name its containers.
-    PROJECT_STACK_NAME="$(echo "$PROJECT_NAME" | tr -d '.')"
     ;;
 esac
 DCCONFIG="${PROJECT_DIR}/${CONFIG_FILE}"
@@ -1458,11 +1387,14 @@ DCCONFIG="${PROJECT_DIR}/${CONFIG_FILE}"
 # If a template repo exists as a local worktree, copy files from there;
 # otherwise, clone a repo and use its included files as templates
 if [[ -d "${TEMPLATE_REPO}" ]]; then
-  DEFAULT_DCCONFIG_TEMPLATE="${TEMPLATE_REPO}/${CONFIG_FILE}.example"
+  DEFAULT_DCCONFIG_TEMPLATE="${TEMPLATE_REPO}/${CONFIG_FILE}.m4"
+  DEFAULT_DOT_ENV_TEMPLATE="${TEMPLATE_REPO}/.env"
 else
-  DEFAULT_DCCONFIG_TEMPLATE="${PROJECT_DIR}/${CONFIG_FILE}.example"
+  DEFAULT_DCCONFIG_TEMPLATE="${PROJECT_DIR}/${CONFIG_FILE}.m4"
+  DEFAULT_DOT_ENV_TEMPLATE="${PROJECT_DIR}/.env"
 fi
 DCCONFIG_TEMPLATE="${YAML_TEMPLATE:-${DEFAULT_DCCONFIG_TEMPLATE}}"
+DOT_ENV_TEMPLATE="${DOT_ENV_TEMPLATE:-${DEFAULT_DOT_ENV_TEMPLATE}}"
 
 case "$MODE" in
   remove)
@@ -1478,27 +1410,17 @@ case "$MODE" in
     read -rp "Really delete? (uppercase YES to confirm) " ANS
     [[ "$ANS" = "YES" ]] || exit 0
     remove "$PROJECT_NAME"
-    run_hook "post-${MODE}"
     ;;
   create)
-    [[ -f "$CONFIG" ]] && echo "Found ${CONFIG} file." || true
+    [[ -f "$CONFIG" ]] && echo "Applying options from ${CONFIG}." || true
     arg_check || { usage; exit 2; }
     # Use defaults in the absence of options
-    [[ -n "$DOCKER_IMAGE_NAME_OPENSLIDES" ]] ||
-      DOCKER_IMAGE_NAME_OPENSLIDES="$DEFAULT_DOCKER_IMAGE_NAME_OPENSLIDES"
-    [[ -n "$DOCKER_IMAGE_TAG_OPENSLIDES" ]] ||
-      DOCKER_IMAGE_TAG_OPENSLIDES="$DEFAULT_DOCKER_IMAGE_TAG_OPENSLIDES"
-    [[ -n "$DOCKER_IMAGE_NAME_CLIENT" ]] ||
-      DOCKER_IMAGE_NAME_CLIENT="$DEFAULT_DOCKER_IMAGE_NAME_CLIENT"
-    [[ -n "$DOCKER_IMAGE_TAG_CLIENT" ]] ||
-      DOCKER_IMAGE_TAG_CLIENT="$DEFAULT_DOCKER_IMAGE_TAG_CLIENT"
     query_user_account_name
     echo "Creating new instance: $PROJECT_NAME"
     PORT=$(next_free_port)
     gen_tls_cert
     create_instance_dir
-    create_config_from_template "${DCCONFIG_TEMPLATE}" \
-      "${PROJECT_DIR}/${CONFIG_FILE}"
+    create_config_from_template
     create_admin_secrets_file
     create_user_secrets_file "${OPENSLIDES_USER_FIRSTNAME}" \
       "${OPENSLIDES_USER_LASTNAME}" "${OPENSLIDES_USER_EMAIL}"
@@ -1517,20 +1439,17 @@ case "$MODE" in
     echo "Creating new instance: $PROJECT_NAME (based on $CLONE_FROM)"
     PORT=$(next_free_port)
     # Parse image and/or tag from original config if necessary
-    IFS=: read -r image tag < <(value_from_yaml "$CLONE_FROM_DIR" x-osserver/image)
     [[ -n "$DOCKER_IMAGE_NAME_OPENSLIDES" ]] ||
-      DOCKER_IMAGE_NAME_OPENSLIDES="${image}"
+      DOCKER_IMAGE_NAME_OPENSLIDES="$(value_from_env "$CLONE_FROM_DIR" DOCKER_OPENSLIDES_BACKEND_NAME)"
     [[ -n "$DOCKER_IMAGE_TAG_OPENSLIDES" ]] ||
-      DOCKER_IMAGE_TAG_OPENSLIDES="${tag}"
-    IFS=: read -r image tag < <(value_from_yaml "$CLONE_FROM_DIR" client/image)
+      DOCKER_IMAGE_TAG_OPENSLIDES="$(value_from_env "$CLONE_FROM_DIR" DOCKER_OPENSLIDES_BACKEND_TAG)"
     [[ -n "$DOCKER_IMAGE_NAME_CLIENT" ]] ||
-      DOCKER_IMAGE_NAME_CLIENT="${image}"
+      DOCKER_IMAGE_NAME_CLIENT="$(value_from_env "$CLONE_FROM_DIR" DOCKER_OPENSLIDES_FRONTEND_NAME)"
     [[ -n "$DOCKER_IMAGE_TAG_CLIENT" ]] ||
-      DOCKER_IMAGE_TAG_CLIENT="${tag}"
+      DOCKER_IMAGE_TAG_CLIENT="$(value_from_env "$CLONE_FROM_DIR" DOCKER_OPENSLIDES_FRONTEND_TAG)"
     gen_tls_cert
     create_instance_dir
-    create_config_from_template "${DCCONFIG_TEMPLATE}" \
-      "${PROJECT_DIR}/${CONFIG_FILE}"
+    create_config_from_template
     clone_secrets
     clone_db
     instance_stop # to force pgnode1 to be restarted
@@ -1568,10 +1487,9 @@ case "$MODE" in
     read -rp "Really delete? (uppercase YES to confirm) " ANS
     [[ "$ANS" = "YES" ]] || exit 0
     instance_erase
-    run_hook "post-${MODE}"
     ;;
   update)
-    [[ -f "$CONFIG" ]] && echo "Found ${CONFIG} file." || true
+    [[ -f "$CONFIG" ]] && echo "Applying options from ${CONFIG}." || true
     arg_check || { usage; exit 2; }
     instance_update
     run_hook "post-${MODE}"

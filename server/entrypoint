@@ -124,6 +124,8 @@ retrieve_configs_from_db() {
     ORDER BY filename, id DESC;" |
   while IFS= read -r -d $'\0' target_filename; do
     echo "Fetching ${target_filename} from database..."
+    d="$(dirname "${target_filename}")"
+    [[ -d "$d" ]] || mkdir -p "$d"
     psql -h db -d instancecfg -qtA <<< "
       SELECT DISTINCT ON (filename) data FROM files
         WHERE filename = '${target_filename}'
@@ -260,4 +262,4 @@ printf 'INFO: Running CMD: "%s".\n' "$*"
 # - daphne -b 0.0.0.0 -p 8000 openslides.asgi:application
 # - gunicorn -w 4 -b 0.0.0.0:8000 -k uvicorn.workers.UvicornWorker \
 #   openslides.asgi:application
-exec $*
+exec "$@"
