@@ -7,7 +7,7 @@ set -o noclobber
 set -o pipefail
 
 # Defaults (override in /etc/osinstancectl)
-TEMPLATE_REPO="/srv/openslides/openslides-docker-compose"
+TEMPLATE_REPO="/srv/openslides/OpenSlides"
 # TEMPLATE_REPO="https://github.com/OpenSlides/openslides-docker-compose"
 OSDIR="/srv/openslides"
 INSTANCES="${OSDIR}/docker-instances"
@@ -94,10 +94,11 @@ Actions:
   update               Update OpenSlides to a new --image
   erase                Remove an instance's volumes (stops the instance if
                        necessary)
-  vicfg                Open settings.py for editing
 
 Options:
   -d, --project-dir    Directly specify the project directory
+  --yaml-template      Specify a YAML template
+  --env-template       Specify a .env template
   --force              Disable various safety checks
   --color=WHEN         Enable/disable color output.  WHEN is never, always, or
                        auto.
@@ -157,7 +158,7 @@ arg_check() {
     fatal "Please specify a project name"; return 2;
   }
   case "$MODE" in
-    "start" | "stop" | "remove" | "erase" | "update" | "vicfg")
+    "start" | "stop" | "remove" | "erase" | "update")
       [[ -d "$PROJECT_DIR" ]] || {
         fatal "Instance '${PROJECT_NAME}' not found."
       }
@@ -269,7 +270,8 @@ create_config_from_template() {
   update_env_file "$temp_file" "POSTFIX_MYHOSTNAME" "$PROJECT_NAME"
   cp -af "$temp_file" "${_env}"
   # Create config from template + .env
-  ( set -a && source "${_env}" && m4 "$DCCONFIG_TEMPLATE" > "${DCCONFIG}" )
+  ( set -a && source "${_env}" &&
+    m4 -DPROJECT_DIR="$PROJECT_DIR" "$DCCONFIG_TEMPLATE" > "${DCCONFIG}" )
   rm -rf "$temp_file" # TODO: trap
 }
 
@@ -277,21 +279,22 @@ create_instance_dir() {
   case "$DEPLOYMENT_MODE" in
     "compose")
       git clone "${TEMPLATE_REPO}" "${PROJECT_DIR}"
+      ln -s docker/docker-compose.yml.m4 "${PROJECT_DIR}/docker-compose.yml.m4"
+      cp "${TEMPLATE_REPO}/docker/.env" "${PROJECT_DIR}/.env"
       ;;
     "stack")
       # If the template repo is a local worktree, copy files from it
       if [[ -d "${TEMPLATE_REPO}" ]]; then
         mkdir -p "${PROJECT_DIR}"
-        # prepare secrets files
-        mkdir -p -m 700 "${PROJECT_DIR}/secrets"
-        cp -f "${TEMPLATE_REPO}/secrets/${ADMIN_SECRETS_FILE}" "${PROJECT_DIR}/secrets/"
-        cp -f "${TEMPLATE_REPO}/secrets/${USER_SECRETS_FILE}" "${PROJECT_DIR}/secrets/"
       else
         # Template repo appears to be remote, so clone it
         git clone "${TEMPLATE_REPO}" "${PROJECT_DIR}"
+        ln -s docker/docker-stack.yml.m4 "${PROJECT_DIR}/docker-stack.yml.m4"
+        cp docker/.env "${PROJECT_DIR}/.env"
       fi
       ;;
   esac
+  mkdir -p -m 700 "${PROJECT_DIR}/secrets"
   touch "${PROJECT_DIR}/${MARKER}"
   # Add .env if template available
   [[ ! -f "$DOT_ENV_TEMPLATE" ]] || cp -af "$DOT_ENV_TEMPLATE" "${PROJECT_DIR}/.env"
@@ -300,7 +303,8 @@ create_instance_dir() {
 }
 
 gen_pw() {
-  read -r -n 15 PW < <(LC_ALL=C tr -dc "[:alnum:]" < /dev/urandom)
+  local len="${1:-15}"
+  read -r -n "$len" PW < <(LC_ALL=C tr -dc "[:alnum:]" < /dev/urandom)
   echo "$PW"
 }
 
@@ -309,7 +313,7 @@ create_admin_secrets_file() {
   [[ -d "${PROJECT_DIR}/secrets" ]] ||
     mkdir -m 700 "${PROJECT_DIR}/secrets"
   printf "OPENSLIDES_ADMIN_PASSWORD=%s\n" "$(gen_pw)" \
-    >> "${PROJECT_DIR}/secrets/${ADMIN_SECRETS_FILE}"
+    > "${PROJECT_DIR}/secrets/${ADMIN_SECRETS_FILE}"
 }
 
 create_user_secrets_file() {
@@ -325,8 +329,7 @@ create_user_secrets_file() {
     last_name="$2"
     email="$3"
     PW="$(gen_pw)"
-    cat << EOF >> "${PROJECT_DIR}/secrets/${USER_SECRETS_FILE}"
-
+    cat << EOF > "${PROJECT_DIR}/secrets/${USER_SECRETS_FILE}"
 # Configured by $ME:
 OPENSLIDES_USER_FIRSTNAME="$first_name"
 OPENSLIDES_USER_LASTNAME="$last_name"
@@ -334,6 +337,12 @@ OPENSLIDES_USER_PASSWORD="$PW"
 OPENSLIDES_USER_EMAIL="$email"
 EOF
   fi
+}
+
+create_django_secrets_file() {
+  echo "Generating Django secret key..."
+  printf "DJANGO_SECRET_KEY='%s'\n" "$(gen_pw 64)" \
+    > "${PROJECT_DIR}/secrets/django.env"
 }
 
 gen_tls_cert() {
@@ -829,7 +838,7 @@ clone_db() {
 
       echo "Shutting down other services."
       docker service rm "${PROJECT_STACK_NAME}_pgbouncer"
-      docker service rm "${PROJECT_STACK_NAME}_prioserver"
+      docker service rm "${PROJECT_STACK_NAME}_server-setup"
       docker service rm "${PROJECT_STACK_NAME}_server"
       docker service rm "${PROJECT_STACK_NAME}_media"
       ;;
@@ -886,34 +895,19 @@ append_metadata() {
 
 ask_start() {
   local start=
-  case "$DEPLOYMENT_MODE" in
-    "compose")
-      read -rp "Start containers? [Y/n] " start
-      case "$start" in
-        Y|y|Yes|yes|YES|"")
-          instance_start ;;
-        *)
-          echo "Not starting containers." ;;
-      esac
-      ;;
-    "stack")
-      # Never start in swarm mode b/c the config files needs to be edited
-      # first
-      printf "%s\n%s\n" \
-        "Next, you should review the configuration file, paying special attention to" \
-        "service placement constraints."
-      printf "\n%s\n  %s\n" "The configuration file is:" \
-        "$PROJECT_DIR/.env"
-      printf "\n%s\n  %s\n" "Afterwards, you can start this instance with:" \
-        "\`osstackctl start $PROJECT_NAME\`."
-      return 0
-      ;;
+  read -rp "Start the instance? [Y/n] " start
+  case "$start" in
+    Y|y|Yes|yes|YES|"")
+      instance_start ;;
+    *)
+      echo "Not starting instance." ;;
   esac
 }
 
 instance_start() {
   # Write YAML config
-  ( set -a  && source "${PROJECT_DIR}/.env" && m4 "$DCCONFIG_TEMPLATE" >| "${DCCONFIG}" )
+  ( set -a  && source "${PROJECT_DIR}/.env" &&
+    m4 -DPROJECT_DIR="$PROJECT_DIR" "$DCCONFIG_TEMPLATE" >| "${DCCONFIG}" )
   case "$DEPLOYMENT_MODE" in
     "compose")
       _docker_compose "$PROJECT_DIR" build
@@ -989,8 +983,7 @@ instance_update() {
   fi
 
   # Start/update if instance was already running
-  local port
-  port="$(value_from_env "$PROJECT_DIR" "EXTERNAL_HTTP_PORT")"
+  source "${PROJECT_DIR}/.env"
   if instance_has_services_running "$PROJECT_STACK_NAME"; then
     case "$DEPLOYMENT_MODE" in
       "compose")
@@ -1016,65 +1009,6 @@ instance_update() {
     append_metadata "$PROJECT_DIR" "$(date +"%F %H:%M"): Updated client to" \
       "${DOCKER_IMAGE_NAME_CLIENT}:${DOCKER_IMAGE_TAG_CLIENT}"
   fi
-}
-
-instance_config() {
-  local start
-  local container_cmd
-  container_cmd='vim personal_data/var/settings.py &&
-    read -p "Commit new settings to database? [Y/n] " commit &&
-    case "$commit" in
-      Y|y|Yes|yes|YES|"") NO_HINT=1 openslides-config add personal_data/var/settings.py ;;
-      *) exit 5 ;;
-    esac'
-  case "$DEPLOYMENT_MODE" in
-    "compose")
-        _docker_compose "$PROJECT_DIR" exec prioserver bash -c "$container_cmd"
-        read -p "Update server containers now? [Y/n] " start
-        case "$start" in
-          Y|y|Yes|yes|YES|"")
-            docker-compose up -d --force-recreate --no-deps server prioserver ;;
-          *)
-            echo "Not updating containers." ;;
-        esac
-        ;;
-    "stack")
-      local this_node_id this_node_name
-      local containerid=
-      read -r this_node_id this_node_name <<< "$(docker node ls \
-        --format '{{.Self}}\t{{.ID}}\t{{.Hostname}}' |
-        awk '$1 == "true" { print $2, $3 }')"
-
-      ls_nodes_with_service() {
-        docker service ps --filter "desired-state=running" \
-          --format '{{.Node}} {{.ID}}' "${PROJECT_STACK_NAME}"_{prio,}server | sort -u
-      }
-      # Try to find the service on this node...
-      read -r node taskid < <(ls_nodes_with_service | grep "$this_node_name" | head -n1) ||
-      # ...or else pick a service from any node
-      read -r node taskid < <(ls_nodes_with_service | head -n1)
-      containerid="$(docker inspect -f '{{.Status.ContainerStatus.ContainerID}}' ${taskid})"
-      # Connect directly or else through SSH
-      if [[ "$node" = "$this_node_name" ]]; then
-        docker exec -it -e "STACK=${PROJECT_STACK_NAME}" "${containerid}" \
-          bash -c "${container_cmd}"
-      else
-        ssh -q -tt "$node" \
-          "docker exec -it -e 'STACK=${PROJECT_STACK_NAME}' '${containerid}' \\
-            bash -c '${container_cmd}'"
-      fi
-
-      read -p "Update server containers now? [Y/n] " start
-      case "$start" in
-        Y|y|Yes|yes|YES|"")
-          docker service update --force ${PROJECT_STACK_NAME}_prioserver
-          docker service update --force ${PROJECT_STACK_NAME}_server
-          ;;
-        *)
-          echo "Not updating containers." ;;
-      esac
-      ;;
-  esac
 }
 
 run_hook() (
@@ -1123,6 +1057,10 @@ longopt=(
   project-dir:
   force
 
+  # Template opions
+  yaml-template:
+  env-template:
+
   # filtering
   all
   online
@@ -1165,6 +1103,14 @@ while true; do
   case "$1" in
     -d|--project-dir)
       PROJECT_DIR="$2"
+      shift 2
+      ;;
+    --yaml-template)
+      YAML_TEMPLATE="$2"
+      shift 2
+      ;;
+    --env-template)
+      DOT_ENV_TEMPLATE="$2"
       shift 2
       ;;
     --server-image)
@@ -1309,11 +1255,6 @@ for arg; do
       }
       shift 1
       ;;
-    vicfg)
-      [[ -z "$MODE" ]] || { usage; exit 2; }
-      MODE=vicfg
-      shift 1
-      ;;
     *)
       # The final argument should be the project name/search pattern
       PROJECT_NAME="$arg"
@@ -1341,12 +1282,14 @@ DEPS=(
   jq
   m4
   nc
-  ssh
 )
 # Check dependencies
 for i in "${DEPS[@]}"; do
     check_for_dependency "$i"
 done
+
+# PROJECT_NAME should be lower-case
+PROJECT_NAME="$(echo "$PROJECT_NAME" | tr '[A-Z]' '[a-z]')"
 
 # Prevent --project-dir to be used together with a project name
 if [[ -n "$PROJECT_DIR" ]] && [[ -n "$PROJECT_NAME" ]]; then
@@ -1387,12 +1330,13 @@ DCCONFIG="${PROJECT_DIR}/${CONFIG_FILE}"
 # If a template repo exists as a local worktree, copy files from there;
 # otherwise, clone a repo and use its included files as templates
 if [[ -d "${TEMPLATE_REPO}" ]]; then
-  DEFAULT_DCCONFIG_TEMPLATE="${TEMPLATE_REPO}/${CONFIG_FILE}.m4"
-  DEFAULT_DOT_ENV_TEMPLATE="${TEMPLATE_REPO}/.env"
+  DEFAULT_DCCONFIG_TEMPLATE="${TEMPLATE_REPO}/docker/${CONFIG_FILE}.m4"
+  DEFAULT_DOT_ENV_TEMPLATE="${TEMPLATE_REPO}/docker/.env"
 else
-  DEFAULT_DCCONFIG_TEMPLATE="${PROJECT_DIR}/${CONFIG_FILE}.m4"
-  DEFAULT_DOT_ENV_TEMPLATE="${PROJECT_DIR}/.env"
+  DEFAULT_DCCONFIG_TEMPLATE="${PROJECT_DIR}/docker/${CONFIG_FILE}.m4"
+  DEFAULT_DOT_ENV_TEMPLATE="${PROJECT_DIR}/docker/.env"
 fi
+# Override default settings from either the config file or command-line options
 DCCONFIG_TEMPLATE="${YAML_TEMPLATE:-${DEFAULT_DCCONFIG_TEMPLATE}}"
 DOT_ENV_TEMPLATE="${DOT_ENV_TEMPLATE:-${DEFAULT_DOT_ENV_TEMPLATE}}"
 
@@ -1424,6 +1368,7 @@ case "$MODE" in
     create_admin_secrets_file
     create_user_secrets_file "${OPENSLIDES_USER_FIRSTNAME}" \
       "${OPENSLIDES_USER_LASTNAME}" "${OPENSLIDES_USER_EMAIL}"
+    create_django_secrets_file
     append_metadata "$PROJECT_DIR" ""
     append_metadata "$PROJECT_DIR" \
       "$(date +"%F %H:%M"): Instance created (${DEPLOYMENT_MODE})"
@@ -1493,10 +1438,6 @@ case "$MODE" in
     arg_check || { usage; exit 2; }
     instance_update
     run_hook "post-${MODE}"
-    ;;
-  vicfg)
-    arg_check || { usage; exit 2; }
-    instance_config
     ;;
   *)
     fatal "Missing command.  Please consult $ME --help."
